@@ -30,4 +30,4 @@ primary_region = "sin"
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "512mb"
+  memory = "1gb"     # JVM peaks ~500 MB RSS under a 20k burst

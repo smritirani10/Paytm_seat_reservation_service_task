@@ -1,5 +1,7 @@
 .git
+target
 bin
+cmd
+internal
 *.md
-!README.md
 burst-report*.json

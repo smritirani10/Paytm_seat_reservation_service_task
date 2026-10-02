@@ -16,14 +16,15 @@ jobs:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/seats?sslmode=disable
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-java@v4
         with:
-          go-version-file: go.mod
-      - run: go vet ./...
-      - run: go test -race -count=1 ./...
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: build + integration tests
+        run: mvn -B test package
       - name: burst against a locally running server
         run: |
-          go build -o bin/server ./cmd/server
-          DATABASE_URL=$TEST_DATABASE_URL ./bin/server > server.log 2>&1 &
+          DATABASE_URL=$TEST_DATABASE_URL java -Xmx256m -jar target/seat-reservation.jar > server.log 2>&1 &
           ./burst.sh http://localhost:8080 -concurrency 2000
       - run: docker build -t seat-reservation .

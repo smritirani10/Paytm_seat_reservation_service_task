@@ -22,6 +22,7 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@db:5432/seats?sslmode=disable
       DB_MAX_CONNS: "40"
+      JAVA_OPTS: "-Xmx384m -XX:+UseSerialGC -Xss256k -XX:ReservedCodeCacheSize=64m -XX:MaxMetaspaceSize=128m -XX:+ExitOnOutOfMemoryError"
       JWT_SECRET: ${JWT_SECRET:-local-dev-jwt-secret}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
       LOG_LEVEL: info

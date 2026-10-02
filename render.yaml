@@ -5,7 +5,7 @@ services:
   - type: web
     name: seat-reservation
     runtime: docker
-    plan: free            # free works; "starter" gives a full CPU for bursts
+    plan: free            # see README: the JVM peaks ~500 MB RSS under a 20k burst; prefer a 1 GB plan
     region: singapore
     healthCheckPath: /readyz
     envVars:
