@@ -2,7 +2,7 @@
 
 ## 1. Where the atomic decision lives
 
-Postgres makes every decision. One `READ COMMITTED` transaction runs these steps (`internal/store/store.go`, `reserveTx`):
+Postgres makes every decision. One `READ COMMITTED` JDBC transaction runs these steps (`src/main/java/com/paytm/seats/store/SeatStore.java`, `reserveTx` / `reserveInTx`). I use plain JDBC rather than JPA so the exact SQL, and so the exact locks, are visible:
 
 1. **`pg_advisory_xact_lock(hashtextextended('user:'||user_id, 0))`.** This serialises all reserve attempts by *one user*, and different users never contend. The per-user limit and concurrent same-key retries depend on it. The lock is transaction-scoped, so a crash or rollback always releases it.
 2. **Idempotency lookup** on `(user_id, idempotency_key)`, done under that lock.
@@ -13,15 +13,15 @@ Postgres makes every decision. One `READ COMMITTED` transaction runs these steps
 5. **Insert the reservation.** The row carries the idempotency key and a request fingerprint.
 6. **Conditional update** guarded on current state:
    `UPDATE seats SET status='confirmed', reservation_id=…, user_id=… WHERE show_id=… AND label = ANY(…) AND status='available'`.
-   We require `RowsAffected == len(seats)`, otherwise we roll back. While we hold the row locks this can't fail, but it is a second, independent guard. Then we commit.
+   We require `executeUpdate() == seats.size()`, otherwise we roll back. While we hold the row locks this can't fail, but it is a second, independent guard. Then we commit.
 
 **Why it's race-free.** The seat *row* is the seat: primary key `(show_id, label)`, with a single `reservation_id` column. A seat can't point at two reservations, by construction. A `CHECK` constraint ties `status` to whether there is an owner.
 
 Take the 500-way race on A12. All 500 transactions queue on A12's row lock. The first one commits. Each waiter then wakes up, and under READ COMMITTED Postgres re-reads the *latest committed* row for `FOR UPDATE`. The waiter sees `confirmed` and declines. There is no window between "is it free?" and "take it", because the check happens on the locked row inside the transaction that writes it.
 
-**Multi-seat and deadlock.** Every transaction locks the seats it wants in the same global order (`ORDER BY label`). So "T1 holds A12 and wants A13" while "T2 holds A13 and wants A12" can't happen. The advisory lock is always taken *before* any seat lock, so the lock order across all lock types is total. As a belt-and-braces measure, deadlock (`40P01`), serialization (`40001`), lock-timeout (`55P03`) and unique-violation (`23505`) errors restart the whole transaction, up to 8 times. `TestMultiSeatNoDeadlockAllOrNothing` fires overlapping pairs in opposite orders. It asserts zero 5xx, and checks that the confirmed count is always even (so no half-reservations).
+**Multi-seat and deadlock.** Every transaction locks the seats it wants in the same global order (`ORDER BY label`). So "T1 holds A12 and wants A13" while "T2 holds A13 and wants A12" can't happen. The advisory lock is always taken *before* any seat lock, so the lock order across all lock types is total. As a belt-and-braces measure, deadlock (`40P01`), serialization (`40001`), lock-timeout (`55P03`) and unique-violation (`23505`) errors restart the whole transaction, up to 8 times. `multiSeatNoDeadlockAllOrNothing` (in `ReservationIntegrationTest`) fires overlapping pairs in opposite orders. It asserts zero 5xx, and checks that the confirmed count is always even (so no half-reservations).
 
-**Fast path (an optimisation, not the decision).** Before opening the locking transaction, one read-only statement checks in a single snapshot whether this is a replay and whether any requested seat is already taken. After the winner of a hot seat commits, the other ~499 are declined by this read without touching locks: roughly 75–90% of burst declines in local runs (`reserve_fast_path_total`). It is safe for two reasons:
+**Fast path (an optimisation, not the decision).** Before opening the locking transaction, one read-only statement checks in a single snapshot whether this is a replay and whether any requested seat is already taken. After the winner of a hot seat commits, the other ~499 are declined by this read without touching locks: most burst declines in local runs (`reserve_fast_path_total`). It is safe for two reasons:
 
 - A decline is truthful. The seat *was* taken at that snapshot.
 - It can't misreport a retry as `seat_taken`. The reservation row and the seat update commit atomically, so any snapshot that shows the seat taken by our earlier attempt also shows that attempt's reservation row. It is one statement, so it is one snapshot.
@@ -74,21 +74,36 @@ Dashboard only, not a page: the decline mix by reason (a spike in `idempotency_c
 
 Every log line carries a `request_id`, so any client complaint can be traced from one header to the exact decision and outcome. The metrics reconcile with the API: the seat gauges are queried from the DB at scrape time, not kept in memory, and the burst script asserts that the counters equal what the client observed.
 
-## 6. Load results (local, 4 vCPU; app, Postgres and the client all on one box)
+## 6. Load results and what the JVM taught me
+
+Local runs on 4 vCPU, with the app, Postgres and the client all on one box:
 
 - 20,000 reserve requests released at once, at concurrency 20,000.
-- Results: **0 × 5xx, 0 network errors**, exactly one `201` per hot seat, every user at exactly 4/4, the invariant held in every poll, and the audit came back `ok`.
-- About 2.5–4k req/s, limited by CPU on the shared box. Under a full 20k-at-once burst, p50 latency is mostly time spent queueing for the 40 DB connections. At concurrency 300 the same 20k requests finished at p99 ≈ 390 ms.
-- I tried an in-process lock-striping "gate" in front of the transaction, to stop waiters from holding pooled connections. It made things worse locally (by serialising the fast path), so I removed it. That is recorded in the commit history.
+- Results: **0 × 5xx, 0 network errors**, exactly one `201` per hot seat, every limit-test user at exactly 4/4, the invariant held in every poll, the audit came back `ok`, and every metric reconciled.
+- About 1.3–2.2k req/s with a warm JVM, limited by CPU on the shared box.
+- **Inside a hard 512 MiB container limit** (the image's default `JAVA_OPTS`), the same burst passed every check, peaking at 468 MiB with no OOM kill.
+
+Two things I measured and changed:
+
+1. **Virtual threads were the wrong default here.** With `spring.threads.virtual.enabled=true`, Tomcat processed all 20k connections at once. Each in-flight request holds about 100 KB of Tomcat buffers, so the heap needed about 2 GB, and at 384 MB it died with OOM. I switched to a **bounded platform worker pool** (`HTTP_THREADS`, default 256):
+   - every connection is still accepted (`max-connections: 50000`) and waits cheaply in the NIO poller
+   - only 256 requests at a time pay the per-request memory
+   - socket buffers are 4 KB instead of 8 KB
+
+   Throughput went up, not down, because the database (40 connections) was always the real limit.
+2. **HikariCP doesn't like 15k waiters.** A thread dump under virtual threads showed about 15,000 threads parked in Hikari's hand-off queue while Postgres sat almost idle. Bounding request concurrency (point 1) also fixes this: Hikari never has more than about 256 borrowers.
+
+(Earlier, in a Go prototype of the same design, I tried an in-process lock-striping gate in front of the transaction. It was slower, because it serialised the fast path, so it was removed. That's in the commit history.)
 
 ## 7. AI usage (directed vs decided)
 
-This service was built with **Claude Code (an AI coding agent)**, working from the assignment text I gave it.
+This service was built with **Claude Code (an AI coding agent)**, working from the assignment text I gave it. The first version was in Go. I then asked for it to be ported to Java with identical behaviour, and the commit history shows both.
 
 - **Generated by the AI:** the code, tests, burst client, Docker/deploy files and the first draft of this write-up. It ran the integration tests and 20k-request bursts against local Postgres and Docker, and it iterated when something failed:
   - the first rerun of the tests surfaced per-user key collisions, which were fixed in the tests (the service behaviour was correct)
   - the first burst plan sold out before the per-user-limit scenario could bite
   - the lock-striping experiment was slower, so it was reverted
+  - in the Java port: curl's default form content type was being re-encoded by Spring (fixed by reading the raw body), a Prometheus name clash (`seats_total`), the virtual-thread OOM and Hikari contention (section 6)
 - **Directed and decided by me:**
 
   > **Candidate: replace this paragraph with your own account.** Cover which choices you reviewed and why you agree with them, or what you changed, and how you deployed and checked the live URL. Expect to be asked to extend this live.
@@ -101,6 +116,7 @@ This service was built with **Claude Code (an AI coding agent)**, working from t
   - all-or-nothing partial requests
   - DB-backed gauges
   - CP under partition
+  - plain JDBC (explicit SQL and locks) and a bounded worker pool instead of virtual threads (section 6)
 
 ## 8. What I'd do next
 

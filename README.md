@@ -1,6 +1,6 @@
 # Seat Reservation at Scale
 
-A small Go + PostgreSQL service that sells assigned seats for a show. It never sells a seat twice, never lets a user go over their per-show limit, and never double-books a retried request, even when tens of thousands of buyers hit the same seats in the same second.
+A small Java 21 / Spring Boot 3 + PostgreSQL service that sells assigned seats for a show. It never sells a seat twice, never lets a user go over their per-show limit, and never double-books a retried request, even when tens of thousands of buyers hit the same seats in the same second.
 
 - **Live URL:** `<add your deployed URL here>` (see [Deploy](#deploy))
 - **Design and trade-offs:** [WRITEUP.md](WRITEUP.md)
@@ -15,10 +15,11 @@ curl localhost:8080/readyz            # {"db":"ok","status":"ready"}
 
 The defaults in compose are `ADMIN_TOKEN=dev-admin-token` and a dev `JWT_SECRET`. Override them with env vars.
 
-Without Docker (needs Go 1.25+ and a Postgres):
+Without Docker (needs JDK 21, Maven and a Postgres):
 
 ```bash
-DATABASE_URL=postgres://postgres:postgres@localhost:5432/seats?sslmode=disable go run ./cmd/server
+mvn -B -DskipTests package
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/seats?sslmode=disable java -jar target/seat-reservation.jar
 make test        # integration tests against TEST_DATABASE_URL
 ```
 
@@ -27,9 +28,12 @@ make test        # integration tests against TEST_DATABASE_URL
 ```bash
 ADMIN_TOKEN=<admin token> ./burst.sh <BASE_URL>          # or: make burst BASE_URL=...
 ./burst.sh <BASE_URL> -requests 20000 -concurrency 5000  # tune the load
+java burst/Burst.java -url <BASE_URL>                    # same thing, directly
 ```
 
-The burst creates a fresh 2,500-seat show (limit 4) and fetches tokens for about 8k users. It then releases 20,000 reserve requests at once:
+The burst client is one Java file that uses only the JDK, so there is no build step. `burst.sh` runs it with your local Java 21+, or in an `eclipse-temurin:21-jdk` container if you don't have one.
+
+It creates a fresh 2,500-seat show (limit 4) and fetches tokens for about 8k users. It then releases 20,000 reserve requests at once:
 
 | scenario | what it fires | must hold |
 |---|---|---|
@@ -52,9 +56,9 @@ It prints the outcome distribution, latency percentiles and a PASS/FAIL table, a
   [PASS] hot seat A12: exactly one 201                           201=1 409=499 other=0
   ...
   [PASS] zero 5xx across the burst                               5xx=0 network_errors=0
-  [PASS] invariant holds after burst                             available=610 held=0 confirmed=1890 total=2500
+  [PASS] invariant holds after burst                             available=605 held=0 confirmed=1895 total=2500
   [PASS] per-user limit: 10 parallel reserves -> exactly limit confirmed 100 users; 201s per user min=4 max=4 (limit 4)
-  [PASS] metric reservations_confirmed_total == observed 201s    metric=1513 observed=1513
+  [PASS] metric reservations_confirmed_total == observed 201s    metric=1487 observed=1487
   ...
 all 20 checks passed
 ```
@@ -63,7 +67,7 @@ all 20 checks passed
 
 ## API
 
-All bodies are JSON. Money is integer paise; a float `price_paise` is rejected with `400`.
+All bodies are JSON (any `Content-Type` is accepted). Money is integer paise: `250.5` and `"250"` are rejected with `400`.
 
 | method & path | auth | notes |
 |---|---|---|
@@ -75,7 +79,7 @@ All bodies are JSON. Money is integer paise; a float `price_paise` is rejected w
 | `GET /reservations/{id}` | owner JWT | |
 | `POST /reservations/{id}/cancel` | owner JWT | `200`, the cancelled reservation (repeat cancels are no-ops), `403` if not the owner |
 | `GET /healthz` | none | liveness: the process is up |
-| `GET /readyz` | none | readiness: migrated and the DB answers within 1s, else `503` |
+| `GET /readyz` | none | readiness: migrated and the DB answers within about 1s, else `503` |
 | `GET /metrics` | none | Prometheus |
 
 The idempotency key can go in the `Idempotency-Key` header or in the body (if both are sent they must match). Keys are scoped per user.
@@ -100,9 +104,11 @@ The idempotency key can go in the `Idempotency-Key` header or in the body (if bo
 - **Metrics** (`/metrics`):
   - `reservations_confirmed_total{show_id}`
   - `reservations_declined_total{show_id,reason}`, with reason one of `seat_taken|per_user_limit|idempotent_replay|idempotency_conflict|unknown_seat`
-  - `seats_available{show_id}`, `seats{show_id,status}` and `seat_invariant_ok{show_id}`. These are read from the database at scrape time, so they always match `GET /shows/{id}`.
-  - also: `seats_confirmed_total`, `seats_released_total`, `reservations_cancelled_total`, `reserve_fast_path_total`, `reserve_internal_errors_total`, `http_requests_total{route,code}`, `http_request_duration_seconds`, `db_pool_*`
-- **Logs:** one JSON line per request on stdout, with `request_id` (taken from `X-Request-ID` or generated, and echoed back in the response header), `route`, `status`, `duration_ms`, `user_id` and `outcome`. Confirmations and cancels get their own lines with `reservation_id` and `seats`. Read them with `docker compose logs -f app`, or in the platform's log viewer.
+  - `seats_available{show_id}`, `seats{show_id,status}`, `show_total_seats{show_id}` and `seat_invariant_ok{show_id}`. These are read from the database at scrape time, so they always match `GET /shows/{id}`.
+  - also: `seats_confirmed_total`, `seats_released_total`, `reservations_cancelled_total`, `reserve_fast_path_total`, `reserve_internal_errors_total`, `http_requests_total{route,code}`, `http_request_duration_seconds`, `http_requests_in_flight`
+  - DB pool: `db_pool_acquired_conns`, `db_pool_idle_conns`, `db_pool_pending_acquires`, `db_pool_max_conns`
+  - standard `jvm_*` metrics
+- **Logs:** one JSON object per line on stdout (Spring Boot structured logging, logstash format). Every line carries `request_id` (taken from `X-Request-ID` or generated, and echoed back in the response header). The access line also has `route`, `status`, `duration_ms`, `user_id` and `outcome`. Confirmations and cancels get their own lines with `reservation_id` and `seats`. Read them with `docker compose logs -f app`, or in the platform's log viewer.
 
 Useful queries:
 
@@ -114,17 +120,21 @@ min(seat_invariant_ok)                         # must always be 1
 
 ## Deploy
 
-**Render (blueprint in `render.yaml`):** in Render, choose New → Blueprint and select this repo. This creates a free Postgres and the Docker web service, and wires up `DATABASE_URL` and `JWT_SECRET`. Set `ADMIN_TOKEN` when prompted. The health check is `/readyz`. Free instances sleep when idle: the first request wakes them, the app starts listening at once, and it runs migrations with retry/backoff. The burst script waits for `/readyz` before it starts.
+**Render (blueprint in `render.yaml`):** in Render, choose New → Blueprint and select this repo. This creates a Postgres and the Docker web service, and wires up `DATABASE_URL` and `JWT_SECRET`. Set `ADMIN_TOKEN` when prompted. The health check is `/readyz`.
 
-**Fly.io:** see the comments in `fly.toml`.
+**Fly.io:** see the comments in `fly.toml`. It is set to 1 GB.
 
-**Railway / anything else that runs a Dockerfile:** set `DATABASE_URL`, `JWT_SECRET` and `ADMIN_TOKEN`.
+**Railway / anything else that runs a Dockerfile:** set `DATABASE_URL`, `JWT_SECRET` and `ADMIN_TOKEN`. Both `postgres://user:pass@host/db` and `jdbc:postgresql://...` forms are accepted.
+
+**Memory:** under a full 20k-connection burst the JVM peaks at about 470–500 MB RSS. It passed every check inside a hard 512 MiB container limit, but that is tight, so use a 1 GB instance where you can. Free instances that sleep when idle wake on the first request: the app starts listening at once and migrates with retry/backoff, and the burst script waits for `/readyz`.
 
 | env | default | |
 |---|---|---|
 | `PORT` | `8080` | |
 | `DATABASE_URL` | local postgres | |
 | `DB_MAX_CONNS` | `40` | keep this under the database's `max_connections` |
+| `HTTP_THREADS` | `256` | worker threads; caps per-request memory |
+| `JAVA_OPTS` | see Dockerfile | heap = 50% of the container limit |
 | `JWT_SECRET` | insecure dev value (logs a warning) | |
 | `ADMIN_TOKEN` | `dev-admin-token` (logs a warning) | |
 | `LOG_LEVEL` | `info` | |
@@ -132,10 +142,14 @@ min(seat_invariant_ok)                         # must always be 1
 ## Layout
 
 ```
-cmd/server        main: config, pool, cold-start migration loop, graceful shutdown
-cmd/burst         stampede + verification client
-internal/store    schema.sql and every correctness decision (transactions)
-internal/api      HTTP handlers, request-id/log/metrics middleware, integration tests
-internal/auth     JWT issue/verify, admin token
-internal/metrics  Prometheus registry, DB-backed seat gauges
+src/main/java/com/paytm/seats/
+  store/SeatStore.java    every correctness decision (JDBC transactions) + audit
+  store/Models.java       records: Show, Reservation, ReserveResult, Audit, ...
+  api/                    controllers, request-id/log/metrics filter, JSON + error mapping
+  auth/Authenticator.java JWT issue/verify, admin token
+  metrics/Metrics.java    Prometheus registry, DB-backed seat gauges, pool gauges
+  config/                 Hikari pools (main + health), cold-start migrator, Tomcat tuning
+src/main/resources/       application.yml, schema.sql
+src/test/java/...         integration tests against real Postgres
+burst/Burst.java          stampede + verification client (single file, JDK only)
 ```
