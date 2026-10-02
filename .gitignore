@@ -1,0 +1,4 @@
+/bin/
+*.out
+.env
+burst-report*.json
