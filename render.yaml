@@ -1,0 +1,30 @@
+# Render Blueprint: New -> Blueprint -> pick this repo. Creates Postgres + the
+# Docker web service, wires DATABASE_URL, generates JWT_SECRET.
+# Set ADMIN_TOKEN yourself (sync: false) and share it with the graders.
+services:
+  - type: web
+    name: seat-reservation
+    runtime: docker
+    plan: free            # free works; "starter" gives a full CPU for bursts
+    region: singapore
+    healthCheckPath: /readyz
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: seat-reservation-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: DB_MAX_CONNS
+        value: "40"
+      - key: LOG_LEVEL
+        value: info
+
+databases:
+  - name: seat-reservation-db
+    plan: free
+    region: singapore
+    databaseName: seats
+    user: seats

@@ -1,0 +1,33 @@
+# Fly.io alternative: fly launch --no-deploy --copy-config
+#   fly postgres create  (or use Neon/Supabase) ; fly postgres attach <db>
+#   fly secrets set JWT_SECRET=$(openssl rand -hex 32) ADMIN_TOKEN=<choose>
+#   fly deploy
+app = "seat-reservation"
+primary_region = "sin"
+
+[build]
+
+[env]
+  PORT = "8080"
+  DB_MAX_CONNS = "40"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"   # keep warm during grading
+  min_machines_running = 1
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 20000
+    hard_limit = 25000
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "15s"
+    method = "GET"
+    path = "/readyz"
+    timeout = "3s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
