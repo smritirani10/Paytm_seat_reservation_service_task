@@ -91,8 +91,12 @@ func do(t *testing.T, method, path, token string, body any) resp {
 	return out
 }
 
+var runID atomic.Int64
+
+// token issues a token for a user name unique to this test run, so reruns
+// (go test -count=N) never collide on per-user idempotency keys.
 func token(t *testing.T, user string) string {
-	tok, _, err := authn.Issue(user)
+	tok, _, err := authn.Issue(fmt.Sprintf("%s-r%d", user, runID.Load()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,6 +105,7 @@ func token(t *testing.T, user string) string {
 
 func newShow(t *testing.T, n, limit int) string {
 	t.Helper()
+	runID.Store(time.Now().UnixNano())
 	seats := make([]string, n)
 	for i := range seats {
 		seats[i] = fmt.Sprintf("S%d", i+1)
@@ -273,7 +278,7 @@ func TestCancelOwnershipAndRebook(t *testing.T) {
 
 	// Spoofed body field is ignored; identity is the token's.
 	r := do(t, "POST", "/shows/"+show+"/reserve", alice, map[string]any{"seats": []string{"S1"}, "idempotency_key": "a1", "user_id": "bob"})
-	if r.Code != 201 || r.Body["user_id"] != "alice" {
+	if r.Code != 201 || r.Body["user_id"] == "bob" || r.Body["user_id"] != fmt.Sprintf("alice-r%d", runID.Load()) {
 		t.Fatalf("reserve: %d %v", r.Code, r.Body)
 	}
 	rid := r.Body["reservation_id"].(string)
