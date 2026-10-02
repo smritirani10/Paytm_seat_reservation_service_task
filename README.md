@@ -1,9 +1,68 @@
 # Seat Reservation at Scale
 
+[![ci](https://github.com/smritirani10/Paytm_seat_reservation_service_task/actions/workflows/ci.yml/badge.svg)](https://github.com/smritirani10/Paytm_seat_reservation_service_task/actions/workflows/ci.yml)
+
 A small Java 21 / Spring Boot 3 + PostgreSQL service that sells assigned seats for a show. It never sells a seat twice, never lets a user go over their per-show limit, and never double-books a retried request, even when tens of thousands of buyers hit the same seats in the same second.
 
-- **Live URL:** https://seat-reservation-rpn6.onrender.com  (free Render instance: the first request after ~15 min idle takes up to a minute to wake; `/readyz` shows when it is up)
+- **Live URL:** https://seat-reservation-rpn6.onrender.com. It's a free Render instance, so the first request after about 15 minutes idle can take up to a minute to wake it; `/readyz` shows when it's up.
 - **Design and trade-offs:** [WRITEUP.md](WRITEUP.md)
+- **Evidence:** every push runs [CI](https://github.com/smritirani10/Paytm_seat_reservation_service_task/actions) on a clean GitHub runner. It builds from scratch, runs the concurrency integration tests against real Postgres, runs the burst against the built server, and builds the Docker image.
+
+## Correctness at a glance
+
+| Requirement | Mechanism | Proven by |
+|---|---|---|
+| No seat sold twice | Row locks in `ORDER BY label` order + `UPDATE … WHERE status='available'` | 500-way hot-seat storm: exactly one `201`, 499 × `409` |
+| Multi-seat requests never deadlock | Global lock order (per-user lock first, then seats by label) | Opposite-order pair storm: 0 × 5xx, never a half-booking |
+| Per-user limit | Transaction-scoped advisory lock per user, then count | 10 parallel reserves at limit 4 → exactly 4 |
+| Idempotent retries | Key stored in the reservation row, `UNIQUE(user_id, key)`, same transaction | 50 concurrent same-key retries → one reservation; different body → `409` |
+| Identity from the token only | JWT subject; body `user_id` is ignored | Spoofed requests are booked to the token's user |
+| Safe release | `UPDATE … WHERE reservation_id = this`; only the owner may cancel | Non-owner `403`; seat rebookable; a stale cancel can't free it |
+| `available + held + confirmed == total` | One-statement snapshot read; `/audit` cross-checks in REPEATABLE READ | Polled throughout every burst |
+| Zero 5xx | Declines are domain outcomes (`409`/`400`); transient DB errors retried | 20,000-request bursts: 0 × 5xx |
+
+## How a reservation is decided
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API (Spring Boot)
+    participant DB as PostgreSQL
+    C->>A: POST /shows/{id}/reserve (JWT, seats, idempotency_key)
+    A->>DB: fast path: one snapshot read (replay? any seat taken?)
+    alt replay or seat already taken
+        DB-->>A: decided without locks
+        A-->>C: 200 replay / 409 seat_taken
+    else looks free
+        A->>DB: BEGIN
+        A->>DB: pg_advisory_xact_lock(user)
+        A->>DB: idempotency lookup, per-user limit check
+        A->>DB: SELECT seats ... ORDER BY label FOR UPDATE
+        A->>DB: INSERT reservation (with key) + UPDATE seats WHERE status='available'
+        A->>DB: COMMIT
+        A-->>C: 201 confirmed (or 409 with reason)
+    end
+```
+
+## Try the live API in 60 seconds
+
+```bash
+URL=https://seat-reservation-rpn6.onrender.com
+ADMIN=<admin token from the submission email>
+
+curl $URL/readyz
+SHOW=$(curl -s -X POST $URL/shows -H "Authorization: Bearer $ADMIN" \
+  -d '{"name":"demo","seats":["A1","A2","A12","A13"],"price_paise":25000}' | sed -E 's/.*"id":"([^"]+)".*/\1/')
+ALICE=$(curl -s -X POST $URL/auth/token -d '{"user_id":"alice"}' | sed -E 's/.*"token":"([^"]+)".*/\1/')
+BOB=$(curl -s -X POST $URL/auth/token -d '{"user_id":"bob"}' | sed -E 's/.*"token":"([^"]+)".*/\1/')
+
+curl -s -X POST $URL/shows/$SHOW/reserve -H "Authorization: Bearer $ALICE" -d '{"seats":["A12"],"idempotency_key":"k1"}'  # 201 confirmed
+curl -s -X POST $URL/shows/$SHOW/reserve -H "Authorization: Bearer $ALICE" -d '{"seats":["A12"],"idempotency_key":"k1"}'  # 200 same reservation (replay)
+curl -s -X POST $URL/shows/$SHOW/reserve -H "Authorization: Bearer $ALICE" -d '{"seats":["A13"],"idempotency_key":"k1"}'  # 409 idempotency_key_conflict
+curl -s -X POST $URL/shows/$SHOW/reserve -H "Authorization: Bearer $BOB"   -d '{"seats":["A12","A13"]}'                  # 409 seat_taken, A13 stays free
+curl -s $URL/shows/$SHOW                                                                                                # counts add up
+curl -s $URL/metrics | grep -E '^(reservations_|seats_available)'
+```
 
 ## Quick start (clean checkout)
 
