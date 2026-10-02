@@ -2,7 +2,7 @@
 
 A small Java 21 / Spring Boot 3 + PostgreSQL service that sells assigned seats for a show. It never sells a seat twice, never lets a user go over their per-show limit, and never double-books a retried request, even when tens of thousands of buyers hit the same seats in the same second.
 
-- **Live URL:** `<add your deployed URL here>` (see [Deploy](#deploy))
+- **Live URL:** https://seat-reservation-rpn6.onrender.com  (free Render instance: the first request after ~15 min idle takes up to a minute to wake; `/readyz` shows when it is up)
 - **Design and trade-offs:** [WRITEUP.md](WRITEUP.md)
 
 ## Quick start (clean checkout)
