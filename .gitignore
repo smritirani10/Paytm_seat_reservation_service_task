@@ -2,3 +2,4 @@
 *.out
 .env
 burst-report*.json
+/target/

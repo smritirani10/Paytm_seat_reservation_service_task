@@ -1,0 +1,42 @@
+server:
+  port: ${PORT:8080}
+  shutdown: graceful
+  tomcat:
+    # 20k concurrent buyers: accept them all; work queues for DB connections, not sockets.
+    max-connections: 50000
+    accept-count: 20000
+    max-keep-alive-requests: -1
+    keep-alive-timeout: 120s
+    connection-timeout: 30s
+  error:
+    whitelabel:
+      enabled: false
+
+spring:
+  main:
+    banner-mode: off
+  threads:
+    virtual:
+      enabled: true          # one cheap virtual thread per request
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+  sql:
+    init:
+      mode: never            # schema is applied by Readiness with retry (cold start safe)
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+    default-property-inclusion: always
+    deserialization:
+      accept-float-as-int: false       # 250.5 paise is a 400, never silently truncated
+      fail-on-unknown-properties: false
+    mapper:
+      allow-coercion-of-scalars: false # "25000" (string) is not a number
+    serialization:
+      write-dates-as-timestamps: false
+
+logging:
+  structured:
+    format:
+      console: logstash      # one JSON object per line on stdout
+  level:
+    root: ${LOG_LEVEL:info}
