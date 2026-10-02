@@ -2,12 +2,16 @@ server:
   port: ${PORT:8080}
   shutdown: graceful
   tomcat:
-    # 20k concurrent buyers: accept them all; work queues for DB connections, not sockets.
+    # 20k concurrent buyers: accept every connection (cheap, it waits in the NIO
+    # poller), but process at most threads.max requests at once (see TomcatConfig).
     max-connections: 50000
     accept-count: 20000
     max-keep-alive-requests: -1
     keep-alive-timeout: 120s
     connection-timeout: 30s
+    threads:
+      max: ${HTTP_THREADS:256}
+      min-spare: 32
   error:
     whitelabel:
       enabled: false
@@ -17,7 +21,7 @@ spring:
     banner-mode: off
   threads:
     virtual:
-      enabled: true          # one cheap virtual thread per request
+      enabled: false         # bounded platform pool: caps per-request memory under a 20k burst
   lifecycle:
     timeout-per-shutdown-phase: 20s
   sql:
