@@ -7,6 +7,15 @@ A small Java 21 / Spring Boot 3 + PostgreSQL service that sells assigned seats f
 
 ## Quick start (clean checkout)
 
+One command builds and starts everything, waits until it's healthy, smoke-tests the API, and opens it in your browser:
+
+```bash
+./run-local.sh            # macOS / Linux / Git Bash   (add --burst to also run the 20k burst)
+.\run-local.ps1           # Windows PowerShell
+```
+
+Or step by step:
+
 ```bash
 docker compose up --build -d          # app on :8080 + postgres
 curl localhost:8080/readyz            # {"db":"ok","status":"ready"}
